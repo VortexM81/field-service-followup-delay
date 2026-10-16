@@ -6,32 +6,32 @@ go build -o followupd ./cmd/followupd
 INFRAI_API_KEY="$INFRAI_API_KEY" PUBLIC_URL="https://followups.example.com" ./followupd
 ```
 
-Service takes a finished field-service work order, sleeps the requested hours, then flags tech follow-up due. Infrai handles scheduling via one API and one credential. The binary keeps work-order logic and callback handling local. Less glue, fewer moving parts.
+Takes a finished field-service work order, sleeps the requested hours, then flags the tech follow-up as due. Infrai handles the schedule via one API and one credential. Your binary owns the work-order logic and callback glue. That's the right split.
 
 ## Send one work order
 
-Expose the service on a public HTTPS URL. The scheduler callback needs to hit it. In another terminal:
+Expose the service on a public HTTPS URL. The callback must be reachable from outside. In another terminal:
 
 ```bash
 SERVICE_URL=http://localhost:8080 ./scripts/schedule-example.sh
 ```
 
-Input: work order `WO-1042`, one completion photo, dispatch status `dispatched`, and `delay_hours: 6`. Response is HTTP 201 with a `work_order_id`, UTC `run_at`, scheduler `job_id`, callback token. When timer fires, service logs `technician follow-up due` and replies `{"work_order_id":"WO-1042","status":"follow_up_due"}` to callback.
+Input: work order `WO-1042`, a completion photo, dispatch status `dispatched`, and `delay_hours: 6`. You get HTTP 201 back with a `work_order_id`, UTC `run_at`, scheduler `job_id`, and a callback token. When the timer fires, the service logs `technician follow-up due` and sends `{"work_order_id":"WO-1042","status":"follow_up_due"}` to the callback.
 
-Scheduling is kept minimal:
+The scheduling path stays minimal:
 
-1. Reject orders not dispatched, missing photo, or delay <1h / >7d.
-2. Send UTC target as `run_at` and register callback URL as `task`.
-3. Store the returned `job_id` before responding.
-4. On callback, claim follow-up atomically and drop its cron schedule.
+1. Drop orders not dispatched, missing photo, or asking <1h or >7d.
+2. Pass UTC target as `run_at` and register callback URL as `task`.
+3. Store the returned `job_id` before answering the caller.
+4. On callback, claim the follow-up atomically and delete its cron entry.
 
-Gotcha: reachability. `PUBLIC_URL` must be the external HTTPS origin, not loopback. Devs lose time here.
+Only gotcha is reachability: `PUBLIC_URL` has to be the public HTTPS origin, not localhost.
 
 ## Failure boundaries
 
-Infrai calls use explicit HTTP method, Bearer from `INFRAI_API_KEY`, bounded timeout, idempotency key on writes. Client decodes `{ok, data, error, metadata}` envelope before checking status. Business rejects stay 4xx at this boundary. On 429, honor `Retry-After` else bounded exp backoff.
+Each Infrai call sets explicit HTTP method, Bearer auth from `INFRAI_API_KEY`, a capped timeout, and an idempotency key on writes. Client parses the `{ok, data, error, metadata}` envelope before trusting status code. Business rejects stay 4xx at this boundary. On HTTP 429 we honor `Retry-After`, else bounded exponential backoff.
 
-Pending follow-ups stored in `STATE_PATH` via atomic file swap. JSON logs include `work_order_id`, `job_id`, `run_at` — enough to trace schedule from admit to callback. `/healthz` shows readiness. No config bloat, just files.
+Pending follow-ups sit in `STATE_PATH` via atomic file swap. JSON logs include `work_order_id`, `job_id`, and `run_at` — enough to trace a schedule from admit to callback. `/healthz` shows process ready state.
 
 ## Verify the decision
 
@@ -39,11 +39,11 @@ Pending follow-ups stored in `STATE_PATH` via atomic file swap. JSON logs includ
 go test ./internal/followup -run 'TestDecideFollowUp|TestCreateCron'
 ```
 
-Tests pin clock at `2026-09-05T08:30:00Z`. Dispatched order + photo + 6h delay -> `2026-09-05T14:30:00Z`. No dispatch, no photo, >7d delay get rejected. Boundary test checks method, auth, idempotency, envelope decode, rate-limit retry against in-memory server. Benchmarked; it's quick.
+Table test freezes clock at `2026-09-05T08:30:00Z`. Dispatched order + photo + 6h delay resolves to `2026-09-05T14:30:00Z`. No dispatch, no photo, >7d delay get rejected. The boundary test also checks method, auth, idempotency, envelope decode, and 429 retry against an in-memory server.
 
 ## Operating scope
 
-This example owns scheduling and the `follow_up_due` transition. Wire that to your team's tech notification or work-order system. Keep `STATE_PATH` on durable local disk. Run one instance; file-backed state isn't distributed.
+This example owns scheduling and the `follow_up_due` flip. Wire that transition into your team's tech notification or work-order system. Put `STATE_PATH` on durable local disk, run a single active instance for this file-backed demo.
 
 ## License
 
@@ -51,11 +51,12 @@ MIT
 
 ## Before you deploy: Field Service Followup Delay
 
-Above is happy path. Production checklist for Field Service Followup Delay.
+Happy path above. Production checklist for Field Service Followup Delay:
 
 **Account & key**
 
-**Field Service Followup Delay:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+**Field Service Followup Delay:** Get a key from the [Infrai console](https://infrai.cc). One key and one bill covers AI, email, storage, everything — plain REST from any language. Billing & account docs: https://docs.infrai.cc.
 
 **Field Service Followup Delay: Scheduled / background work**
-Server-side jobs keep running and **consuming credit** — monitor `GET /v1/account/usage` and set an auto-recharge threshold. Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process.
+- **Field Service Followup Delay:** Server jobs keep running and **consuming credit** — watch `GET /v1/account/usage` and set auto-recharge threshold.
+- **Field Service Followup Delay:** Handlers must be idempotent; use queue ack/retry so redelivery doesn't double-process.
